@@ -53,25 +53,6 @@ To get the bot's user id (required in `.env`), find the bot's profile on your sl
 
 <img src="images/vpiuid.png" style="width:500px;display:block;margin-left:auto;margin-right:auto"/>
 
-
-### Using [just](https://github.com/casey/just):
-`just` allows the abstraction of a few of these setup tasks, see the full set of tasks in the `.justfile`.
-
-After setting API keys (as above), you can create a virtual environment, install dependencies, and create a `./pdfs/` directory, by running:
-```bash
-just setup
-```
-
-Then (after adding your PDFs to `./pdfs/` you can start the slackbot using:
-```bash
-just run
-```
-
-To record the reactions by scanning a slack channel, set the appropriate `.env` variables and run:
-```bash
-just scan
-```
-
 ## Saving State
 
 When the script starts it will check if a pickled version of the dense vector containing the documents is already available in the PDF directory. If found it will use that existing state (which saves time and the cost of API calls), otherwise it will parse the PDFs, embed them into the FAISS dense vector and then save this state for next time.
@@ -81,10 +62,7 @@ NB: If you add/remove PDFs you will need to remove the state file!
 ```bash
 rm /path/to/your/PDF/directory/docs.pkl
 ```
-or
-```bash
-just clean
-```
+
 
 ## Add to Slack Workspace
 
@@ -108,4 +86,4 @@ docker run --restart=unless-stopped -d -v ./pdfs:/app/pdfs --env-file=./.env vir
 ```
 This has the benefit of allowing multiple bots running on varied pdf sources. You can build the image once, then spin up a new container (changing the `./pdfs` directory and probably `.env`.
 
-Note that for now, the `.env` format is not compatible between `just run` and `docker run`. For Docker, remove the `export` and quotation marks from the `.env` file. TODO: fix this.
+For Docker, remove the `export` and quotation marks from the `.env` file. TODO: fix this hack.
