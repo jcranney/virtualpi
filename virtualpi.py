@@ -1,4 +1,3 @@
-#!/usr/bin/python3
 #
 #NB: The following environment variables need to be set:
 # export OPENAI_API_KEY="sk-M...M"
@@ -10,12 +9,129 @@
 #David Brodrick, 2023
 
 import sys, os, pickle, glob
-from paperqa import Docs
 from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
-from openai import AsyncOpenAI
 from tqdm import tqdm
-chat = AsyncOpenAI()
+import numpy as np
+from openai import OpenAI
+from tika import parser
+
+local_client = OpenAI(
+    base_url="http://localhost:8002/v1",
+    api_key = "sk-no-key-required"
+)
+client = OpenAI()
+PAPERDIR=sys.argv[1]
+
+def chunk(text,chunk_size=1000):
+    chunks = []
+    for i in range(len(text[::chunk_size])):
+        chunks.append(text[i*chunk_size:(i+1)*chunk_size])
+    return chunks
+
+def embed(chunks,client,*,model="llama"):
+    return [d.embedding for d in client.embeddings.create(input=chunks,model=model).data]
+
+def format_and_filter_embeddings(metadata,chunks,embeddings):
+    print(f"{len([t for t in embeddings if len(t)>0]):d}/{len(embeddings):d} used")
+    return [{
+        "text":chunk,
+        "embedding":embedding,
+        "metadata":metadata
+        } for chunk,embedding in zip(chunks,embeddings)
+        if len(embedding)>0]
+
+#We require a directory containing PDFs as an argument
+if len(sys.argv)!=2:
+    print("Requires the path to a repository of PDFs as an argument.")
+    sys.exit(1)
+PAPERDIR=sys.argv[1]
+if not os.path.exists(PAPERDIR):
+    print("The specified directory does not exist.")
+    sys.exit(1)
+
+try:
+    with open("%s/data.pkl"%PAPERDIR, "rb") as f:
+        #Save this state for next time
+        print("\nTrying to load file %s/data.pkl."%PAPERDIR)
+        data = pickle.load(f)
+except FileNotFoundError:
+    papers=[]
+    filesfound=glob.glob("%s/*"%PAPERDIR)
+    for p in filesfound:
+        if p.lower().endswith(".pdf"):
+            papers.append(p)
+
+    if not papers:
+        print("No PDFs were found in the specified directory.")
+        sys.exit(1)
+
+    print("Found %d PDFs in %s"%(len(papers),PAPERDIR))
+    data = []
+    pbar = tqdm(papers,leave=True,desc="")
+    for paper in pbar:
+        try:
+            #Get the base file name to use as the citation
+            citation=os.path.split(paper)[-1]
+            citation=citation[0:citation.rfind(".")]
+            #Embed this doc
+            pbar.set_description(f"parseing  {citation:s}")
+            raw = parser.from_file(paper)
+            pbar.set_description(f"chunking  {citation:s}")
+            chunks = chunk(raw["content"])
+            pbar.set_description(f"embedding {citation:s}")
+            embeddings = embed(chunks,local_client)
+            data += format_and_filter_embeddings(citation,chunks,embeddings)
+        except OSError as e: #Exception as e:
+            print("Error processing %s: %s"%(p,e))
+
+    with open("%s/data.pkl"%PAPERDIR, "wb") as f:
+        #Save this state for next time
+        print("\nSaving state to file %s/data.pkl - this may take some time."%PAPERDIR)
+        pickle.dump(data, f)
+
+b = np.array([d["embedding"] for d in data])
+
+def query(prompt,*,data=data,embed_client=local_client,embed_model="llama",
+          llm_client=client,llm_model="gpt-3.5-turbo",
+          k=5,answer_length="about 100 words"):
+    a = np.array(embed([prompt],embed_client,model=embed_model))
+    cos_sim = (a@b.T)[0]/np.linalg.norm(a.flatten())/np.linalg.norm(b,axis=1)
+    sim_index = np.argsort(cos_sim)[::-1][:k]
+    contexts = "".join([f'### Citation:\n{d["metadata"]}\n### Context:{d["text"]}\n\n' for d in np.array(data)[sim_index]])
+
+    messages = [
+        {
+            "role" : "system",
+            "content" : ("Answer in a direct and concise tone. Your audience is an expert, "
+                         "so be highly specific. If there are ambiguous terms or acronyms, "
+                         "first define them.")
+        },
+        {
+            "role" : "user",
+            "content" : (llm_prompt:=("Answer the question below with the context.\n\n"
+                         f"## Contexts:\n\n{contexts}\n\n----\n\n"
+                         f"## Question: {prompt}\n\nWrite an answer based on the context. "
+                         "If the context provides insufficient information and the "
+                         "question cannot be directly answered, reply 'I cannot answer.' "
+                         "For each part of your answer, indicate which sources most support "
+                         "it via citation keys at the end of sentences, like "
+                         "(1234.56789). Only cite from the context. "
+                         "Write in the style of a Wikipedia "
+                         "article, with concise sentences and coherent paragraphs. The context "
+                         "comes from a variety of sources and is only a summary, so there "
+                         "may inaccuracies or ambiguities. If quotes are present and relevant, "
+                         "use them in the answer. This answer will go directly onto Wikipedia, "
+                         f"so do not add any extraneous information.\n\nAnswer ({answer_length}):"))
+        }
+    ]
+    response = llm_client.chat.completions.create(model=llm_model,
+                                   messages=messages)
+    return {
+        "answer":response.choices[0].message.content,
+        "llm_prompt" : llm_prompt,
+        "contexts":contexts,
+        "messages":messages,
+    }
 
 #Create handle to Slack
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
@@ -30,88 +146,15 @@ def event_test(say, body):
         user_question=body["event"]["blocks"][0]["elements"][0]["elements"][1]["text"]
         if user_question:
             #Do the paper-qa query and get the answer to the question
-            answer = docs.query(user_question, k=30, max_sources=10)
+            answer = query(user_question, k=50)
             #Print some stuff locally
-            print(answer.formatted_answer)
+            print(answer["answer"])
             print("\n\n\n")
             #Send the (minimal) answer to Slack
-            say(answer.answer)
+            say(answer["answer"])
     except Exception as e:
         print("Error: %s"%e)
 
-############################################################
-#Main/program start point
-
-#We require a directory containing PDFs as an argument
-if len(sys.argv)!=2:
-    print("Requires the path to a repository of PDFs as an argument.")
-    sys.exit(1)
-PAPERDIR=sys.argv[1]
-if not os.path.exists(PAPERDIR):
-    print("The specified directory does not exist.")
-    sys.exit(1)
-
-try:
-    #Load the pre-pickled document vector if it exists
-    with open("%s/docs.pkl"%PAPERDIR, "rb") as f:
-        docs = pickle.loads(pickle.load(f))
-    docs.set_client(chat)
-    print("Loaded previous state from %s/docs.pkl"%PAPERDIR)
-    print(" - remove this file if you change the set of PDFs\n")
-except FileNotFoundError:
-    docs = None
-
-if docs is None:
-    #Couldn't load a pre-picked version
-    papers=[]
-    filesfound=glob.glob("%s/*"%PAPERDIR)
-    for p in filesfound:
-        if p.lower().endswith(".pdf"):
-            papers.append(p)
-
-    if not papers:
-        print("No PDFs were found in the specified directory.")
-        sys.exit(1)
-
-    print("Found %d PDFs in %s"%(len(papers),PAPERDIR))
-
-    #Add each paper in turn to paper-qa/FAISS/OpenAI embedding     
-    docs = Docs(llm="gpt-3.5-turbo",client=chat)
-    print("Embedding documents")
-    pbar = tqdm(papers,leave=True,desc="")
-    for p in pbar:
-        try:
-            #Get the base file name to use as the citation
-            citation=os.path.split(p)[-1]
-            citation=citation[0:citation.rfind(".")]
-            #Embed this doc
-            pbar.set_description(f"doc={citation:s}")
-            docs.add(p,docname=citation,citation=citation)
-        except Exception as e:
-            print("Error processing %s: %s"%(p,e))
-    try:
-        with open("%s/docs.pkl"%PAPERDIR, "wb") as f:
-            #Save this state for next time
-            print("\nSaving state to file %s/docs.pkl - this may take some time."%PAPERDIR)
-            pickle.dump(pickle.dumps(docs), f)
-    except Exception as e:
-        print("Couldn't save state into %s - is it writeable?"%PAPERDIR)
-        print("Error was: %s"%e)
-        sys.exit(2)
-
-docs.prompts.qa = ("Write an answer ({answer_length}) "
-    "for the question below based on the provided context. "
-    "If the context provides insufficient information, "
-    'reply "I cannot answer". '
-    "For each part of your answer, indicate which sources most support it "
-    "via valid citation markers at the end of sentences, like (Example2012). "
-    "Answer in an unbiased, comprehensive, and scholarly tone. "
-    "If the question is subjective, provide an opinionated answer in the concluding 1-2 sentences. "
-    "Use Markdown for formatting code or text, and try to use direct quotes to support arguments.\n\n"
-    "{context}\n"
-    "Question: {question}\n"
-    "Answer: ")
-
 #Set up the Slack interface to start servicing requests
 print("Starting Slack handler - bot is ready to answer your questions!")
-SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+#SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
