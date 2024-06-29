@@ -3,4 +3,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY virtualpi.py .
-CMD ["ipython","virtualpi.py","./pdfs"]
+RUN apt-get update -y
+RUN apt-get install default-jdk -y
+CMD ["python","-u","virtualpi.py","./pdfs"]
