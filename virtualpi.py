@@ -14,12 +14,25 @@ from tqdm import tqdm
 import numpy as np
 from openai import OpenAI
 from tika import parser
+from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-local_client = OpenAI(
-    base_url="http://localhost:8002/v1",
-    api_key = "sk-no-key-required"
-)
-client = OpenAI()
+embed_mode = "local" # "local" or "openai"
+
+llm_client = OpenAI()
+llm_model = "gpt-4o"
+
+if embed_mode == "local":
+    embed_client = OpenAI(
+        base_url="http://localhost:8002/v1",
+        api_key = "sk-no-key-required"
+    )
+    embed_model = "llama"
+elif embed_mode == "openai":
+    embed_client = llm_client
+    embed_model = "text-embedding-3-small"
+else:
+    raise ValueError(f"embed_mode: `{embed_mode}` not supported. Choose either `local` or `openai`")
+
 PAPERDIR=sys.argv[1]
 
 def chunk(text,chunk_size=1000):
@@ -28,7 +41,7 @@ def chunk(text,chunk_size=1000):
         chunks.append(text[i*chunk_size:(i+1)*chunk_size])
     return chunks
 
-def embed(chunks,client,*,model="llama"):
+def embed(chunks,client,*,model=embed_model):
     return [d.embedding for d in client.embeddings.create(input=chunks,model=model).data]
 
 def format_and_filter_embeddings(metadata,chunks,embeddings):
@@ -79,7 +92,7 @@ except FileNotFoundError:
             pbar.set_description(f"chunking  {citation:s}")
             chunks = chunk(raw["content"])
             pbar.set_description(f"embedding {citation:s}")
-            embeddings = embed(chunks,local_client)
+            embeddings = embed(chunks,embed_client)
             data += format_and_filter_embeddings(citation,chunks,embeddings)
         except OSError as e: #Exception as e:
             print("Error processing %s: %s"%(p,e))
@@ -91,13 +104,13 @@ except FileNotFoundError:
 
 b = np.array([d["embedding"] for d in data])
 
-def query(prompt,*,data=data,embed_client=local_client,embed_model="llama",
-          llm_client=client,llm_model="gpt-3.5-turbo",
+def query(prompt,*,data=data,embed_client=embed_client,embed_model=embed_model,
+          llm_client=llm_client,llm_model=llm_model,
           k=5,answer_length="about 100 words"):
     a = np.array(embed([prompt],embed_client,model=embed_model))
     cos_sim = (a@b.T)[0]/np.linalg.norm(a.flatten())/np.linalg.norm(b,axis=1)
     sim_index = np.argsort(cos_sim)[::-1][:k]
-    contexts = "".join([f'### Citation:\n{d["metadata"]}\n### Context:{d["text"]}\n\n' for d in np.array(data)[sim_index]])
+    contexts = "".join([f'### Citation Key:\n{d["metadata"]}\n### Context:{d["text"]}\n\n' for d in np.array(data)[sim_index]])
 
     messages = [
         {
@@ -114,8 +127,8 @@ def query(prompt,*,data=data,embed_client=local_client,embed_model="llama",
                          "If the context provides insufficient information and the "
                          "question cannot be directly answered, reply 'I cannot answer.' "
                          "For each part of your answer, indicate which sources most support "
-                         "it via citation keys at the end of sentences, like "
-                         "(1234.56789). Only cite from the context. "
+                         "it via a reference at the end of sentences, in the form "
+                         "`(CITATION_KEY)`. Only cite text from the context. "
                          "Write in the style of a Wikipedia "
                          "article, with concise sentences and coherent paragraphs. The context "
                          "comes from a variety of sources and is only a summary, so there "
@@ -133,6 +146,7 @@ def query(prompt,*,data=data,embed_client=local_client,embed_model="llama",
         "messages":messages,
     }
 
+print("starting up")
 #Create handle to Slack
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
@@ -146,7 +160,7 @@ def event_test(say, body):
         user_question=body["event"]["blocks"][0]["elements"][0]["elements"][1]["text"]
         if user_question:
             #Do the paper-qa query and get the answer to the question
-            answer = query(user_question, k=50)
+            answer = query(user_question, k=30)
             #Print some stuff locally
             print(answer["answer"])
             print("\n\n\n")
@@ -157,4 +171,4 @@ def event_test(say, body):
 
 #Set up the Slack interface to start servicing requests
 print("Starting Slack handler - bot is ready to answer your questions!")
-#SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
